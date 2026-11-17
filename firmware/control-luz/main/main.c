@@ -214,6 +214,115 @@ static double redondear1(float v)
     return round((double)v * 10.0) / 10.0;
 }
 
+// ===== WiFi / MQTT =====
+static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_t event_id, void *event_data)
+{
+    esp_mqtt_event_handle_t event = (esp_mqtt_event_handle_t)event_data;
+    switch (event_id) {
+        case MQTT_EVENT_CONNECTED:
+            mqtt_ok = true;
+            ESP_LOGI(TAG, "MQTT conectado");
+            {
+                char topic[128];
+                snprintf(topic, sizeof(topic), "nodealert/%s/commands", DEVICE_ID);
+                esp_mqtt_client_subscribe(mqtt_client, topic, 1);
+            }
+            break;
+        case MQTT_EVENT_DISCONNECTED:
+            mqtt_ok = false;
+            ESP_LOGW(TAG, "MQTT desconectado");
+            break;
+        case MQTT_EVENT_DATA: {
+            char topic[128];
+            int tlen = event->topic_len < (int)sizeof(topic)-1 ? event->topic_len : (int)sizeof(topic)-1;
+            memcpy(topic, event->topic, tlen);
+            topic[tlen] = '\0';
+            char data[128];
+            int dlen = event->data_len < (int)sizeof(data)-1 ? event->data_len : (int)sizeof(data)-1;
+            memcpy(data, event->data, dlen);
+            data[dlen] = '\0';
+            // trim
+            char *start = data;
+            while (*start == ' ' || *start == '\t' || *start == '\r' || *start == '\n') start++;
+            char *end = start + strlen(start);
+            while (end > start && (end[-1] == ' ' || end[-1] == '\t' || end[-1] == '\r' || end[-1] == '\n')) *--end = '\0';
+            ESP_LOGI(TAG, "Comando recibido: %s", start);
+            if (strcmp(start, "REBOOT") == 0) {
+                esp_restart();
+            } else {
+                ESP_LOGW(TAG, "Comando desconocido: %s", start);
+            }
+            break;
+        }
+        default:
+            break;
+    }
+}
+
+static void wifi_event_handler(void *arg, esp_event_base_t event_base, int32_t event_id, void *event_data)
+{
+    if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
+        esp_wifi_connect();
+    } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
+        wifi_ok = false;
+        esp_wifi_connect();
+    } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
+        wifi_ok = true;
+        ESP_LOGI(TAG, "WiFi conectado");
+        if (!mqtt_client) {
+            esp_mqtt_client_config_t cfg = {
+                .broker.address.uri = MQTT_BROKER_URI,
+                .credentials.username = MQTT_USER,
+                .credentials.authentication.password = MQTT_PASS,
+            };
+            mqtt_client = esp_mqtt_client_init(&cfg);
+            esp_mqtt_client_register_event(mqtt_client, ESP_EVENT_ANY_ID, mqtt_event_handler, NULL);
+            esp_mqtt_client_start(mqtt_client);
+        }
+    }
+}
+
+static void wifi_init(void)
+{
+    esp_netif_init();
+    esp_event_loop_create_default();
+    esp_netif_create_default_wifi_sta();
+    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+    esp_wifi_init(&cfg);
+    esp_event_handler_instance_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &wifi_event_handler, NULL, NULL);
+    esp_event_handler_instance_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &wifi_event_handler, NULL, NULL);
+    wifi_config_t wcfg = { .sta = { .threshold.authmode = WIFI_AUTH_WPA2_PSK } };
+    strncpy((char *)wcfg.sta.ssid, WIFI_SSID, sizeof(wcfg.sta.ssid));
+    strncpy((char *)wcfg.sta.password, WIFI_PASS, sizeof(wcfg.sta.password));
+    esp_wifi_set_mode(WIFI_MODE_STA);
+    esp_wifi_set_config(WIFI_IF_STA, &wcfg);
+    esp_wifi_start();
+}
+
+static void publicar_telemetria(bool stale)
+{
+    if (!mqtt_ok || !mqtt_client) return;
+    cJSON *root = cJSON_CreateObject();
+    cJSON_AddStringToObject(root, "device_id", DEVICE_ID);
+    if (!stale) cJSON_AddNumberToObject(root, "presencia", sistema_activo ? 1 : 0);
+    if (bh_ventana_ok) cJSON_AddNumberToObject(root, "luz_ventana_lx", redondear1(lux_ventana));
+    if (bh_aula_ok) cJSON_AddNumberToObject(root, "luz_aula_lx", redondear1(lux_aula));
+    if (sht_ok) {
+        cJSON_AddNumberToObject(root, "temp_c", redondear1(temp_c));
+        cJSON_AddNumberToObject(root, "humedad_pct", redondear1(humedad_pct));
+    }
+    if (RELE_PIN >= 0) cJSON_AddNumberToObject(root, "rele_canal1", luz_encendida ? 1 : 0);
+
+    char *json = cJSON_PrintUnformatted(root);
+    char topic[128];
+    snprintf(topic, sizeof(topic), "nodealert/%s/telemetry", DEVICE_ID);
+    esp_mqtt_client_publish(mqtt_client, topic, json, 0, 1, 0);
+    free(json);
+    cJSON_Delete(root);
+    ultima_publicacion = aura_millis();
+    publicar_ya = false;
+}
+
 // ===== Diagnostico del radar =====
 static bool diag_pendiente = true;
 static uint32_t diag_ultimo_ms = 0;
@@ -253,6 +362,7 @@ void app_main(void)
     }
     ESP_ERROR_CHECK(err);
 
+    wifi_init();
 
     if (RELE_PIN >= 0) configurar_gpio_salida(RELE_PIN, RELE_ACTIVO_EN_LOW ? 1 : 0);
     if (LED_PRESENCIA_PIN >= 0)
@@ -358,6 +468,10 @@ void app_main(void)
                      luz_encendida ? "ON" : "off");
         }
 
+        bool vencio_pub = aura_millis() - ultima_publicacion >= INTERVALO_PUBLICACION_S * 1000UL;
+        if (wifi_ok && mqtt_ok && (publicar_ya || vencio_pub)) {
+            publicar_telemetria(stale);
+        }
 
         vTaskDelay(pdMS_TO_TICKS(20));
     }
