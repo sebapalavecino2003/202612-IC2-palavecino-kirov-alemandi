@@ -22,7 +22,9 @@ void app_main(void) {
         ld2420_update(&radar);
         uint16_t dist = ld2420_distancia_cm(&radar);
         bool mov = ld2420_movimiento(&radar);
-        ESP_LOGI(TAG, "Movimiento: %d, Distancia: %u cm", mov, dist);
+        bool presencia = mov && (dist >= DIST_MIN_CM && dist <= DIST_MAX_CM);
+        gpio_set_level(LED_PRESENCIA_PIN, presencia ? 1 : 0);
+        ESP_LOGI(TAG, "Presencia: %s", presencia ? "SI" : "no");
         vTaskDelay(pdMS_TO_TICKS(200));
     }
 }
