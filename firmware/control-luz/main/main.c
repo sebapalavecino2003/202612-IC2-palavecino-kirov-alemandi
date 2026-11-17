@@ -241,37 +241,42 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
             int dlen = event->data_len < (int)sizeof(data)-1 ? event->data_len : (int)sizeof(data)-1;
             memcpy(data, event->data, dlen);
             data[dlen] = '\0';
-            ESP_LOGI(TAG, "Comando recibido: %s", data);
-            if (strcmp(data, "REBOOT") == 0) {
+            // trim
+            char *start = data;
+            while (*start == ' ' || *start == '\t' || *start == '\r' || *start == '\n') start++;
+            char *end = start + strlen(start);
+            while (end > start && (end[-1] == ' ' || end[-1] == '\t' || end[-1] == '\r' || end[-1] == '\n')) *--end = '\0';
+            ESP_LOGI(TAG, "Comando recibido: %s", start);
+            if (strcmp(start, "REBOOT") == 0) {
                 esp_restart();
-            } else if (strcmp(data, "RELE_ON") == 0) {
+            } else if (strcmp(start, "RELE_ON") == 0) {
                 bool prev = luz_encendida;
                 manual_override = true;
                 luz_encendida = true;
                 escribir_rele(luz_encendida);
                 publicar_ya = true;
                 ESP_LOGI(TAG, "RELE: %d -> %d (GPIO %d)", prev, luz_encendida, RELE_PIN);
-            } else if (strcmp(data, "RELE_OFF") == 0) {
+            } else if (strcmp(start, "RELE_OFF") == 0) {
                 bool prev = luz_encendida;
                 manual_override = true;
                 luz_encendida = false;
                 escribir_rele(luz_encendida);
                 publicar_ya = true;
                 ESP_LOGI(TAG, "RELE: %d -> %d (GPIO %d)", prev, luz_encendida, RELE_PIN);
-            } else if (strcmp(data, "AUTO") == 0) {
+            } else if (strcmp(start, "AUTO") == 0) {
                 manual_override = false;
                 publicar_ya = true;
                 ESP_LOGI(TAG, "Modo automatico reanudado");
-            } else if (strcmp(data, "LED_ON") == 0) {
+            } else if (strcmp(start, "LED_ON") == 0) {
                 led_presencia(true);
-            } else if (strcmp(data, "LED_OFF") == 0) {
+            } else if (strcmp(start, "LED_OFF") == 0) {
                 led_presencia(false);
-            } else if (strcmp(data, "BUZZER_ON") == 0) {
+            } else if (strcmp(start, "BUZZER_ON") == 0) {
                 if (RELE_PIN >= 0) { /* no buzzer pin defined; ignore */ }
-            } else if (strcmp(data, "BUZZER_OFF") == 0) {
+            } else if (strcmp(start, "BUZZER_OFF") == 0) {
                 /* no-op */
             } else {
-                ESP_LOGW(TAG, "Comando desconocido: %s", data);
+                ESP_LOGW(TAG, "Comando desconocido: %s", start);
             }
             break;
         }
